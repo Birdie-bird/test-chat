@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cross-site chat test</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 780px; margin: 28px auto; padding: 0 16px; color: #14122b; }
+  h1 { font-size: 1.5rem; margin: 0 0 6px; }
+  code { background: #eef0f6; padding: 2px 6px; border-radius: 4px; }
+  label { display: block; font-weight: 600; margin: 10px 0 3px; font-size: .88rem; }
+  input[type=text], input[type=password] { width: 100%; box-sizing: border-box; padding: 8px 10px; font: inherit; border: 1px solid #b9bdd0; border-radius: 8px; }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 4px; }
+  .row label { font-weight: 400; display: inline-flex; gap: 6px; align-items: center; margin: 0; }
+  button { font: inherit; font-weight: 600; padding: 9px 16px; border: 0; border-radius: 999px; background: #14122b; color: #fff; cursor: pointer; margin: 10px 8px 4px 0; }
+  button.alt { background: #fff; color: #14122b; border: 2px solid #14122b; }
+  button:disabled { opacity: .4; cursor: default; }
+  pre { background: #14122b; color: #fff; padding: 12px 14px; border-radius: 12px; white-space: pre-wrap; min-height: 150px; font-size: 13px; line-height: 1.5; }
+  .status { margin: 8px 0; font-size: .92rem; }
+  .warn { background: #fff3cd; padding: 10px 14px; border-radius: 8px; display: none; margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1>Cross-site chat test</h1>
+<p>This page runs on <code id="origin">(script not running)</code>, a different site from the endpoint.<br>Okta sign-in return address for this page: <code id="pageurl"></code></p>
+<div class="warn" id="warn"></div>
+
+<label for="key">Campaign API key (the data-apikey value)</label>
+<input id="key" type="password" autocomplete="off">
+<label for="src">Zoom SDK address (the src of your working tag)</label>
+<input id="src" type="text" value="https://us01ccistatic.zoom.us/us01cci/web-sdk/chat-client.js">
+<label for="endpoint">Authentication endpoint on the other domain</label>
+<input id="endpoint" type="text" value="https://zcc.coolestwork.com/api/auth">
+<label for="issuer">Okta issuer (same as OKTA_ISSUER in Cloudflare)</label>
+<input id="issuer" type="text" placeholder="https://your-org.okta.com/oauth2/default">
+<label for="client">Okta client ID of the Single-Page app for this page</label>
+<input id="client" type="text">
+
+<label>How the page proves who the student is</label>
+<div class="row">
+  <label><input type="radio" name="method" value="bearer" checked> Okta token in an Authorization header (works across sites)</label>
+  <label><input type="radio" name="method" value="cookie"> Login cookie (fails across sites)</label>
+</div>
+<label>Which token to send</label>
+<div class="row">
+  <label><input type="radio" name="tok" value="id_token" checked> ID token</label>
+  <label><input type="radio" name="tok" value="access_token"> Access token</label>
+</div>
+
+<div class="status" id="status"></div>
+<div>
+  <button id="signin" type="button">1. Sign in with Okta</button>
+  <button id="start" type="button">2. Start</button>
+  <button id="chat" type="button" disabled>3. Chat now</button>
+  <button id="probe" class="alt" type="button">Test the endpoint call</button>
+  <button id="signout" class="alt" type="button">Forget tokens</button>
+</div>
+<pre id="log"></pre>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const FIELDS = ["key", "src", "endpoint", "issuer", "client"];
+function log(text) { const b = $("log"); b.textContent += new Date().toISOString().slice(11, 23) + "  " + text + "\n"; b.scrollTop = b.scrollHeight; }
+const val = (id) => $(id).value.trim();
+const radio = (name) => document.querySelector('input[name="' + name + '"]:checked').value;
+const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+// Form values are kept for this browser TAB only, so they survive the round trip to Okta. Nothing is sent anywhere.
+function saveForm() { sessionStorage.setItem("lt_form", JSON.stringify(Object.fromEntries(FIELDS.map((f) => [f, $(f).value])))); }
+function restoreForm() {
+  try { const f = JSON.parse(sessionStorage.getItem("lt_form") || "{}"); FIELDS.forEach((k) => { if (f[k]) $(k).value = f[k]; }); } catch (e) {}
+}
+const tokens = () => { try { return JSON.parse(sessionStorage.getItem("lt_tokens") || "null"); } catch (e) { return null; } };
+// When does a token expire? (read from the token's own exp field; nothing is sent anywhere)
+function tokenExp(token) {
+  try { return JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).exp * 1000; } catch (e) { return null; }
+}
+const clock = (ms) => new Date(ms).toLocaleTimeString();
+function expiryNote(label, token) {
+  const exp = token && tokenExp(token);
+  if (!exp) return "";
+  return " " + label + (exp > Date.now() ? " valid until " + clock(exp) + "." : " EXPIRED at " + clock(exp) + ", press 1. Sign in with Okta again.");
+}
+function showStatus() {
+  const t = tokens();
+  $("status").textContent = t
+    ? "Signed in to Okta in this tab." + expiryNote("ID token", t.id_token) + expiryNote("Access token", t.access_token)
+    : "Not signed in to Okta in this tab.";
+}
+
+$("origin").textContent = location.origin;
+// The page's own address, used as the Okta sign-in return address. For GitHub Pages this is something like
+// https://yourname.github.io/test-chat/ (include the trailing slash when you register it in Okta).
+const PAGE_URL = location.origin + location.pathname;
+$("pageurl").textContent = PAGE_URL;
+$("origin").textContent = location.origin;
+const FILE_DEFAULTS = { src: $("src").value, endpoint: $("endpoint").value };
+if (location.protocol === "file:") {
+  $("warn").style.display = "block";
+  $("warn").textContent = "This page was opened as a file. Serve it with a local web server instead, or the test is not valid.";
+}
+restoreForm();
+if ($("endpoint").value !== FILE_DEFAULTS.endpoint) {
+  setTimeout(() => log("Note: the endpoint box shows a value saved earlier in this tab (" + $("endpoint").value + "), not the one written in the file (" + FILE_DEFAULTS.endpoint + "). Edit the box, or press Forget tokens to clear saved values."), 0);
+}
+
+async function discover() {
+  const r = await fetch(val("issuer").replace(/\/+$/, "") + "/.well-known/openid-configuration");
+  if (!r.ok) throw new Error("Okta discovery failed (" + r.status + "). Check the issuer.");
+  return r.json();
+}
+
+// ---- Sign in with Okta: authorization code + PKCE, run entirely in this page (no server, no client secret) ----
+$("signin").addEventListener("click", async () => {
+  if (!val("issuer") || !val("client")) { log("Fill in the Okta issuer and client ID first."); return; }
+  try {
+    const doc = await discover();
+    const verifier = b64url(crypto.getRandomValues(new Uint8Array(48)));
+    const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+    const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+    const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
+    sessionStorage.setItem("lt_pkce", JSON.stringify({ verifier, state }));
+    saveForm();
+    const url = new URL(doc.authorization_endpoint);
+    url.search = new URLSearchParams({ client_id: val("client"), response_type: "code", scope: "openid profile email",
+      redirect_uri: PAGE_URL, state, nonce, code_challenge: challenge, code_challenge_method: "S256" }).toString();
+    log("sending you to Okta to sign in...");
+    location.href = url.toString();
+  } catch (e) { log("sign-in could not start: " + e.message); }
+});
+
+async function finishSignIn() {
+  const p = new URLSearchParams(location.search);
+  if (p.get("error")) { log("Okta returned an error: " + p.get("error") + " " + (p.get("error_description") || "")); history.replaceState(null, "", location.pathname); return; }
+  if (!p.get("code")) return;
+  const saved = JSON.parse(sessionStorage.getItem("lt_pkce") || "{}");
+  history.replaceState(null, "", location.pathname);
+  if (p.get("state") !== saved.state) { log("Sign-in rejected: the state value did not match."); return; }
+  try {
+    const doc = await discover();
+    const r = await fetch(doc.token_endpoint, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+      body: new URLSearchParams({ grant_type: "authorization_code", code: p.get("code"), redirect_uri: PAGE_URL, client_id: val("client"), code_verifier: saved.verifier }) });
+    const t = await r.json();
+    if (!r.ok || !t.id_token) { log("Okta token request failed: " + (t.error_description || t.error || r.status)); return; }
+    sessionStorage.setItem("lt_tokens", JSON.stringify({ id_token: t.id_token, access_token: t.access_token || "" }));
+    sessionStorage.removeItem("lt_pkce");
+    log("Signed in to Okta. Token(s) received and kept in this tab only.");
+  } catch (e) { log("sign-in could not finish: " + e.message); }
+}
+
+FIELDS.forEach((f) => $(f).addEventListener("change", () => { saveForm(); if (f === "endpoint") log("Endpoint changed. Requests from this page now go to " + $("endpoint").value); }));
+$("signout").addEventListener("click", () => { sessionStorage.removeItem("lt_tokens"); sessionStorage.removeItem("lt_form"); log("Tokens and saved form values forgotten."); showStatus(); });
+
+// ---- The call the SDK's getAuthCredentials() makes ----
+async function fetchJwt() {
+  const url = val("endpoint");
+  const method = radio("method");
+  try {
+    let r;
+    if (method === "bearer") {
+      const t = tokens();
+      const token = t && t[radio("tok")];
+      if (!token) { log("No " + radio("tok") + " yet. Press 1. Sign in with Okta first."); return null; }
+      const exp = tokenExp(token);
+      if (exp && exp < Date.now()) { log("Your Okta " + radio("tok") + " expired at " + clock(exp) + ". Press 1. Sign in with Okta again."); return null; }
+      log("PAGE request: GET " + url + "  with the Okta " + radio("tok") + " in an Authorization header (no cookie)");
+      r = await fetch(url, { headers: { Authorization: "Bearer " + token }, credentials: "omit" });
+    } else {
+      log("PAGE request: GET " + url + "  with cookies (credentials: include)");
+      r = await fetch(url, { credentials: "include" });
+    }
+    log("endpoint answered " + r.status + (r.status === 401 ? "  (the endpoint could not tell who you are)" : ""));
+    if (!r.ok) return null;
+    const j = await r.json();
+    return j.loginUserIdJwt || j.token || null;
+  } catch (e) {
+    log("request failed: " + e.message + "  (usually CORS: is " + location.origin + " in ALLOWED_ORIGINS?)");
+    return null;
+  }
+}
+
+let started = false, ready = false;
+window.addEventListener("zoomCampaignSdk:ready", () => { ready = true; log("Zoom SDK is ready"); });
+
+$("start").addEventListener("click", () => {
+  if (started) { log("Already started. Reload the page to start again."); return; }
+  if (!val("key")) { log("Paste the API key first."); return; }
+  if (!val("src")) { log("Enter the SDK address first."); return; }
+  started = true;
+  // Zoom's multi-domain pattern: this page supplies the JWT. Set BEFORE the SDK script loads.
+  window.zoomCampaignSdkConfig = { getAuthCredentials: async () => { log("Zoom SDK called getAuthCredentials()"); return fetchJwt(); } };
+  const s = document.createElement("script");
+  s.type = "module";
+  s.setAttribute("data-apikey", val("key"));
+  s.src = val("src");
+  s.onerror = () => log("the Zoom script failed to load: " + val("src"));
+  document.head.appendChild(s);
+  log("Zoom script added");
+  saveForm();
+  $("chat").disabled = false;
+  $("start").disabled = true;
+});
+
+$("chat").addEventListener("click", () => {
+  if (ready) { log("calling open()"); window.zoomCampaignSdk.open(); return; }
+  log("waiting for the SDK to be ready, then calling open()");
+  window.addEventListener("zoomCampaignSdk:ready", () => { log("calling open()"); window.zoomCampaignSdk.open(); }, { once: true });
+});
+
+$("probe").addEventListener("click", async () => {
+  log("testing the endpoint call by hand...");
+  const jwt = await fetchJwt();
+  log(jwt ? "got a token (" + jwt.length + " characters)" : "no token returned");
+});
+
+log("Page ready. Nothing has been loaded from Zoom yet.");
+showStatus();
+finishSignIn().then(showStatus);
+setInterval(showStatus, 15000);
+</script>
+</body>
+</html>
